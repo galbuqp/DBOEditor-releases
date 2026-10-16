@@ -1,0 +1,327 @@
+# Fonte do workflow do repositório público galbuqp/DBOEditor-releases
+# (lá fica em .github/workflows/release.yml; mudou aqui, copie para lá).
+#
+# Disparo (nunca automático):
+#   lançamento: gh workflow run release.yml -R galbuqp/DBOEditor-releases -f tag=vX.Y.Z -f latest=true
+#   teste:      gh workflow run release.yml -R galbuqp/DBOEditor-releases -f tag=<branch|sha> -f latest=false
+#
+# `tag` é a REF DO REPOSITÓRIO PRIVADO a compilar. O nome do release no público sai dela:
+#   latest=true  -> release `vX.Y.Z` (a tag tem de existir no privado, estar no main e bater com a versão
+#                   de apps/desktop/package.json); publicado como `latest` (o atualizador passa a vê-lo).
+#   latest=false -> release `test-<ref>-<sha7>`, publicado como pre-release, nunca `latest`.
+# O release nasce como rascunho e só é publicado depois que Windows e Mac subiram tudo e o latest.json
+# tem as três plataformas; um release já publicado nunca é reaproveitado (o run falha).
+
+name: release
+run-name: ${{ inputs.latest == 'true' && 'Lançamento' || 'Build de teste' }} ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Ref do repositório privado (vX.Y.Z para lançamento; branch ou commit para teste)'
+        required: true
+        type: string
+      latest:
+        description: 'true = lançamento oficial (vira latest); false = build de teste (pre-release)'
+        required: true
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
+
+permissions:
+  contents: write
+
+# Um lançamento por vez: a checagem de "latest" do fim depende disso.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: galbuqp/DBOEditor
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      version: ${{ steps.resolve.outputs.version }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      release_id: ${{ steps.draft.outputs.release_id }}
+      prerelease: ${{ steps.inputs.outputs.prerelease }}
+      previous_latest: ${{ steps.draft.outputs.previous_latest }}
+    steps:
+      - name: Conferir entradas
+        id: inputs
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_LATEST: ${{ inputs.latest }}
+        run: |
+          set -euo pipefail
+          case "$INPUT_LATEST" in
+            true) PRE=false ;;
+            false) PRE=true ;;
+            *) echo "::error::latest precisa ser 'true' ou 'false'"; exit 1 ;;
+          esac
+          if [ "$INPUT_LATEST" = true ]; then
+            if ! [[ "$INPUT_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo "::error::lançamento (latest=true) exige tag vX.Y.Z; veio '$INPUT_TAG'"; exit 1
+            fi
+            CHECKOUT_REF="refs/tags/$INPUT_TAG"
+          else
+            if ! [[ "$INPUT_TAG" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+              echo "::error::ref inválida: '$INPUT_TAG'"; exit 1
+            fi
+            CHECKOUT_REF="$INPUT_TAG"
+          fi
+          echo "prerelease=$PRE" >> "$GITHUB_OUTPUT"
+          echo "checkout_ref=$CHECKOUT_REF" >> "$GITHUB_OUTPUT"
+
+      - name: Baixar package.json do privado
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          ref: ${{ steps.inputs.outputs.checkout_ref }}
+          path: src
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: apps/desktop/package.json
+          sparse-checkout-cone-mode: false
+
+      - name: Resolver commit, versão e nome do release
+        id: resolve
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_LATEST: ${{ inputs.latest }}
+          GH_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: |
+          set -euo pipefail
+          SHA=$(git -C src rev-parse HEAD)
+          SHA7=${SHA:0:7}
+          VERSION=$(node -p "require('./src/apps/desktop/package.json').version")
+          if [ "$INPUT_LATEST" = true ]; then
+            if [ "v$VERSION" != "$INPUT_TAG" ]; then
+              echo "::error::a tag $INPUT_TAG não bate com a versão do app ($VERSION) em apps/desktop/package.json"; exit 1
+            fi
+            # A tag precisa estar no main do privado (nunca lançar um commit de branch de teste).
+            STATUS=$(gh api "repos/$SOURCE_REPO/compare/main...$SHA" --jq .status)
+            if [ "$STATUS" != identical ] && [ "$STATUS" != behind ]; then
+              echo "::error::$INPUT_TAG ($SHA7) não está no main do privado (compare: $STATUS)"; exit 1
+            fi
+            RELEASE_TAG="$INPUT_TAG"
+          else
+            NAME=${INPUT_TAG#refs/heads/}
+            NAME=${NAME#refs/tags/}
+            NAME=$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-40)
+            RELEASE_TAG="test-$NAME-$SHA7"
+          fi
+          echo "Commit $SHA, versão $VERSION, release $RELEASE_TAG"
+          {
+            echo "sha=$SHA"
+            echo "version=$VERSION"
+            echo "release_tag=$RELEASE_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Criar (ou retomar) o rascunho do release
+        id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          INPUT_LATEST: ${{ inputs.latest }}
+          INPUT_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ steps.resolve.outputs.release_tag }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+          PRE: ${{ steps.inputs.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          # gh api imprime o corpo do erro no stdout: sem latest (404) vira vazio.
+          PREV=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name 2>/dev/null) || PREV=""
+          [[ "$PREV" =~ ^[A-Za-z0-9._-]+$ ]] || PREV=""
+          echo "previous_latest=$PREV" >> "$GITHUB_OUTPUT"
+          echo "latest atual: ${PREV:-(nenhum)}"
+
+          # RELEASE_TAG só tem [A-Za-z0-9._-], então pode ir direto no filtro.
+          FOUND=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$RELEASE_TAG\") | \"\(.id) \(.draft) \(.prerelease)\"")
+          COUNT=$(printf '%s' "$FOUND" | grep -c . || true)
+          if [ "$COUNT" -gt 1 ]; then
+            echo "::error::há $COUNT releases com a tag $RELEASE_TAG; apague os duplicados"; exit 1
+          fi
+
+          if [ "$INPUT_LATEST" = true ] && [ -n "$PREV" ] && [ "$PREV" != "$RELEASE_TAG" ]; then
+            HIGHEST=$(printf '%s\n%s\n' "${PREV#v}" "$VERSION" | sort -V | tail -n1)
+            if [ "$HIGHEST" != "$VERSION" ]; then
+              echo "::error::$RELEASE_TAG não é mais novo que o latest atual ($PREV)"; exit 1
+            fi
+          fi
+
+          if [ "$INPUT_LATEST" = true ]; then
+            TITLE="DBOEditor $RELEASE_TAG"
+            HEAD=""
+          else
+            TITLE="DBOEditor (teste) $INPUT_TAG @ ${SHA:0:7}"
+            HEAD="> **Build de teste** de \`$INPUT_TAG\` (commit \`${SHA:0:7}\`, versão $VERSION). Não é uma versão oficial e o app instalado não recebe este build como atualização."
+          fi
+          cat > body.md <<EOF
+          $HEAD
+
+          ## Como instalar
+
+          - **Windows 10/11 (64 bits):** baixe o arquivo terminado em \`-setup.exe\` e execute.
+          - **Mac (macOS 12 ou mais novo, Apple Silicon e Intel):** baixe o \`.dmg\`, abra e arraste o DBOEditor para Aplicativos.
+
+          ## Primeira abertura
+
+          Os instaladores não têm certificado de assinatura de código, então o sistema avisa na primeira vez:
+
+          - **Windows** mostra "O Windows protegeu o computador": clique em **Mais informações** e depois em **Executar assim mesmo**.
+          - **macOS 15 ou mais novo** diz que não pôde verificar o app: clique em **OK**, abra **Ajustes do Sistema → Privacidade e Segurança**, role até o fim e clique em **Abrir Mesmo Assim** ao lado do aviso do DBOEditor (pede a senha do Mac). Depois abra o app de novo e confirme em **Abrir Mesmo Assim**.
+          - **macOS 12 a 14:** clique com o botão direito no DBOEditor em Aplicativos, escolha **Abrir** e confirme em **Abrir**.
+
+          Isso só acontece uma vez. Depois o app abre normalmente e se atualiza sozinho ao abrir.
+          EOF
+
+          if [ -n "$FOUND" ]; then
+            read -r ID DRAFT EXISTING_PRE <<< "$FOUND"
+            if [ "$DRAFT" != true ]; then
+              echo "::error::o release $RELEASE_TAG já foi publicado; não será sobrescrito. Para refazer, apague o release e a tag $RELEASE_TAG no repositório público."; exit 1
+            fi
+            if [ "$EXISTING_PRE" != "$PRE" ]; then
+              echo "::error::já existe um rascunho $RELEASE_TAG com prerelease=$EXISTING_PRE (esperado $PRE); apague-o"; exit 1
+            fi
+            echo "Retomando o rascunho $ID"
+            gh api -X PATCH "repos/$GH_REPO/releases/$ID" -f name="$TITLE" -F body=@body.md > /dev/null
+          else
+            ID=$(gh api -X POST "repos/$GH_REPO/releases" \
+              -f tag_name="$RELEASE_TAG" -f target_commitish="$GITHUB_SHA" \
+              -f name="$TITLE" -F body=@body.md -F draft=true -F prerelease="$PRE" --jq .id)
+            echo "Rascunho criado: $ID"
+          fi
+          echo "release_id=$ID" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            args: ''
+            rust_targets: wasm32-unknown-unknown
+          - platform: macos-latest
+            args: '--target universal-apple-darwin'
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin,wasm32-unknown-unknown
+    runs-on: ${{ matrix.platform }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Baixar o código do privado
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          # o commit exato conferido no prepare (o branch pode andar no meio do run)
+          ref: ${{ needs.prepare.outputs.sha }}
+          path: src
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.24.0
+          package_json_file: src/package.json
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: src/pnpm-lock.yaml
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src -> target
+            src/apps/desktop/src-tauri -> target
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.15.0
+
+      - name: Instalar dependências
+        working-directory: src
+        run: pnpm install --frozen-lockfile
+
+      - name: Compilar, assinar e subir para o rascunho
+        # tauri-action v1.0.0 (fixado no commit)
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          # O release já existe (rascunho do prepare): sem tagName, a action só sobe os arquivos.
+          releaseId: ${{ needs.prepare.outputs.release_id }}
+          # vira o campo "notes" do latest.json
+          releaseBody: DBOEditor ${{ needs.prepare.outputs.version }}
+          projectPath: src/apps/desktop
+          tauriScript: pnpm tauri
+          args: ${{ matrix.args }}
+          uploadUpdaterJson: true
+          retryAttempts: 1
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Conferir arquivos e publicar
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ID: ${{ needs.prepare.outputs.release_id }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PRE: ${{ needs.prepare.outputs.prerelease }}
+          PREV: ${{ needs.prepare.outputs.previous_latest }}
+        run: |
+          set -euo pipefail
+          NAMES=$(gh api "repos/$GH_REPO/releases/$ID/assets?per_page=100" --jq '.[].name')
+          printf '%s\n' "$NAMES"
+          for pat in '-setup\.exe$' '-setup\.exe\.sig$' '\.dmg$' '\.app\.tar\.gz$' '\.app\.tar\.gz\.sig$' '^latest\.json$'; do
+            if ! printf '%s\n' "$NAMES" | grep -Eq -- "$pat"; then
+              echo "::error::falta um arquivo ($pat) no release $RELEASE_TAG"; exit 1
+            fi
+          done
+
+          LJ=$(gh api "repos/$GH_REPO/releases/$ID/assets?per_page=100" --jq '.[] | select(.name == "latest.json") | .id')
+          gh api "repos/$GH_REPO/releases/assets/$LJ" -H 'Accept: application/octet-stream' > latest.json
+          node -e '
+            const j = JSON.parse(require("fs").readFileSync("latest.json", "utf8"));
+            if (j.version !== process.env.VERSION) throw new Error(`latest.json com versão ${j.version}, esperado ${process.env.VERSION}`);
+            for (const p of ["windows-x86_64", "darwin-aarch64", "darwin-x86_64"]) {
+              const e = j.platforms?.[p];
+              if (!e?.url || !e?.signature) throw new Error(`latest.json sem a plataforma ${p}`);
+            }
+            console.log("latest.json ok:", Object.keys(j.platforms).join(", "));
+          '
+
+          if [ "$PRE" = false ]; then MAKE_LATEST=true; else MAKE_LATEST=false; fi
+          gh api -X PATCH "repos/$GH_REPO/releases/$ID" \
+            -f tag_name="$RELEASE_TAG" -F draft=false -F prerelease="$PRE" -f make_latest="$MAKE_LATEST" > /dev/null
+
+          NOW=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name 2>/dev/null) || NOW=""
+          [[ "$NOW" =~ ^[A-Za-z0-9._-]+$ ]] || NOW=""
+          if [ "$PRE" = false ]; then
+            [ "$NOW" = "$RELEASE_TAG" ] || { echo "::error::latest aponta para '$NOW', esperado $RELEASE_TAG"; exit 1; }
+            echo "Publicado $RELEASE_TAG como latest."
+          else
+            if [ "$NOW" = "$RELEASE_TAG" ] || [ "$NOW" != "$PREV" ]; then
+              echo "::error::o build de teste mexeu no latest ('$PREV' -> '$NOW'); corrija à mão já"; exit 1
+            fi
+            echo "Publicado $RELEASE_TAG como pre-release; latest continua '${NOW:-(nenhum)}'."
+          fi
