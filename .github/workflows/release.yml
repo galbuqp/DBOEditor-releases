@@ -32,9 +32,10 @@ on:
 permissions:
   contents: write
 
-# Um lançamento por vez: a checagem de "latest" do fim depende disso.
+# Um lançamento oficial por vez (a checagem de "latest" do fim depende disso); builds de teste têm
+# fila própria e nunca esperam por um lançamento nem o atrasam.
 concurrency:
-  group: release
+  group: release-${{ inputs.latest == 'true' && 'oficial' || 'teste' }}
   cancel-in-progress: false
 
 env:
@@ -279,7 +280,7 @@ jobs:
     needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
-      - name: Conferir arquivos e publicar
+      - name: Conferir arquivos, corrigir o latest.json e publicar
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -287,10 +288,10 @@ jobs:
           RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
           VERSION: ${{ needs.prepare.outputs.version }}
           PRE: ${{ needs.prepare.outputs.prerelease }}
-          PREV: ${{ needs.prepare.outputs.previous_latest }}
         run: |
           set -euo pipefail
-          NAMES=$(gh api "repos/$GH_REPO/releases/$ID/assets?per_page=100" --jq '.[].name')
+          gh api "repos/$GH_REPO/releases/$ID/assets?per_page=100" > assets.json
+          NAMES=$(jq -r '.[].name' assets.json)
           printf '%s\n' "$NAMES"
           for pat in '-setup\.exe$' '-setup\.exe\.sig$' '\.dmg$' '\.app\.tar\.gz$' '\.app\.tar\.gz\.sig$' '^latest\.json$'; do
             if ! printf '%s\n' "$NAMES" | grep -Eq -- "$pat"; then
@@ -298,30 +299,72 @@ jobs:
             fi
           done
 
-          LJ=$(gh api "repos/$GH_REPO/releases/$ID/assets?per_page=100" --jq '.[] | select(.name == "latest.json") | .id')
+          LJ=$(jq -r '.[] | select(.name == "latest.json") | .id' assets.json)
           gh api "repos/$GH_REPO/releases/assets/$LJ" -H 'Accept: application/octet-stream' > latest.json
+
+          # A tauri-action grava URLs da API (api.github.com/.../releases/assets/<id>), que sem login
+          # têm limite de 60 pedidos/hora por IP. A atualização é obrigatória, então troca pelas URLs
+          # públicas de download do release (github.com/.../releases/download/<tag>/<arquivo>), que
+          # passam a valer quando o rascunho é publicado logo abaixo.
           node -e '
-            const j = JSON.parse(require("fs").readFileSync("latest.json", "utf8"));
-            if (j.version !== process.env.VERSION) throw new Error(`latest.json com versão ${j.version}, esperado ${process.env.VERSION}`);
+            const fs = require("fs");
+            const { VERSION, GH_REPO, RELEASE_TAG } = process.env;
+            const j = JSON.parse(fs.readFileSync("latest.json", "utf8"));
+            const names = new Map(JSON.parse(fs.readFileSync("assets.json", "utf8")).map((a) => [String(a.id), a.name]));
+            if (j.version !== VERSION) throw new Error(`latest.json com versão ${j.version}, esperado ${VERSION}`);
             for (const p of ["windows-x86_64", "darwin-aarch64", "darwin-x86_64"]) {
               const e = j.platforms?.[p];
               if (!e?.url || !e?.signature) throw new Error(`latest.json sem a plataforma ${p}`);
             }
-            console.log("latest.json ok:", Object.keys(j.platforms).join(", "));
+            const base = `https://github.com/${GH_REPO}/releases/download/${encodeURIComponent(RELEASE_TAG)}/`;
+            for (const [p, e] of Object.entries(j.platforms)) {
+              if (e.url.startsWith(base)) continue;
+              const m = /\/releases\/assets\/(\d+)$/.exec(e.url);
+              const name = m && names.get(m[1]);
+              if (!name) throw new Error(`URL inesperada em ${p}: ${e.url}`);
+              e.url = base + encodeURIComponent(name);
+            }
+            fs.writeFileSync("latest.json", JSON.stringify(j, null, 2));
+            console.log("latest.json:", Object.entries(j.platforms).map(([p, e]) => `${p} -> ${e.url}`).join("\n  "));
           '
+          gh api -X DELETE "repos/$GH_REPO/releases/assets/$LJ"
+          curl -fsS -o /dev/null -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" -H 'Content-Type: application/json' \
+            --data-binary @latest.json \
+            "https://uploads.github.com/repos/$GH_REPO/releases/$ID/assets?name=latest.json"
 
           if [ "$PRE" = false ]; then MAKE_LATEST=true; else MAKE_LATEST=false; fi
           gh api -X PATCH "repos/$GH_REPO/releases/$ID" \
             -f tag_name="$RELEASE_TAG" -F draft=false -F prerelease="$PRE" -f make_latest="$MAKE_LATEST" > /dev/null
 
+          # As URLs públicas respondem (latest.json e cada instalador do atualizador).
+          DL="https://github.com/$GH_REPO/releases/download/$RELEASE_TAG"
+          ok=
+          for i in 1 2 3 4 5 6; do
+            if curl -fsSL "$DL/latest.json" -o published.json; then ok=1; break; fi
+            sleep 10
+          done
+          [ -n "$ok" ] || { echo "::error::$DL/latest.json não respondeu"; exit 1; }
+          if grep -q 'api.github.com' published.json; then
+            echo "::error::o latest.json publicado ainda aponta para a API"; exit 1
+          fi
+          for u in $(jq -r '.platforms[].url' published.json | sort -u); do
+            curl -fsSL -r 0-0 -o /dev/null "$u" || { echo "::error::não baixa: $u"; exit 1; }
+          done
+
           NOW=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name 2>/dev/null) || NOW=""
           [[ "$NOW" =~ ^[A-Za-z0-9._-]+$ ]] || NOW=""
           if [ "$PRE" = false ]; then
             [ "$NOW" = "$RELEASE_TAG" ] || { echo "::error::latest aponta para '$NOW', esperado $RELEASE_TAG"; exit 1; }
+            V=$(curl -fsSL "https://github.com/$GH_REPO/releases/latest/download/latest.json" | jq -r .version)
+            [ "$V" = "$VERSION" ] || { echo "::error::releases/latest/download/latest.json tem versão '$V', esperado $VERSION"; exit 1; }
             echo "Publicado $RELEASE_TAG como latest."
           else
-            if [ "$NOW" = "$RELEASE_TAG" ] || [ "$NOW" != "$PREV" ]; then
-              echo "::error::o build de teste mexeu no latest ('$PREV' -> '$NOW'); corrija à mão já"; exit 1
+            # Um lançamento oficial pode ter rodado em paralelo (fila separada), então não se compara
+            # com o latest de antes: basta o teste ser pre-release e não ser o latest.
+            IS_PRE=$(gh api "repos/$GH_REPO/releases/$ID" --jq .prerelease)
+            if [ "$IS_PRE" != true ] || [ "$NOW" = "$RELEASE_TAG" ]; then
+              echo "::error::o build de teste $RELEASE_TAG virou latest ou não é pre-release; corrija à mão já"; exit 1
             fi
             echo "Publicado $RELEASE_TAG como pre-release; latest continua '${NOW:-(nenhum)}'."
           fi
