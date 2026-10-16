@@ -171,7 +171,7 @@ jobs:
           ## Como instalar
 
           - **Windows 10/11 (64 bits):** baixe o arquivo terminado em \`-setup.exe\` e execute.
-          - **Mac (macOS 12 ou mais novo, Apple Silicon e Intel):** baixe o \`.dmg\`, abra e arraste o DBOEditor para Aplicativos.
+          - **Mac (macOS 12 ou mais novo, Apple Silicon e Intel):** baixe o \`.dmg\`, abra e arraste o DBOEditor para Aplicativos. No macOS 12 e 13, o Safari precisa estar na versão 16.4 ou mais nova (atualize pela Atualização de Software).
 
           ## Primeira abertura
 
@@ -258,6 +258,18 @@ jobs:
         working-directory: src
         run: pnpm install --frozen-lockfile
 
+      # Os testes Rust da casca Tauri (commands.rs) e do dbo-fs só rodam aqui (nunca fora do CI).
+      # Uma vez basta: no Mac, antes de compilar; falhou, nada é compilado nem enviado.
+      - name: Testes do Rust (casca Tauri e dbo-fs)
+        if: matrix.platform == 'macos-latest'
+        run: |
+          set -euo pipefail
+          # Sem o recurso custom-protocol (só o tauri build liga) o app compila em modo dev e não lê a
+          # pasta do frontend; ela é criada vazia só por garantia (o tauri build a refaz).
+          mkdir -p src/apps/desktop/dist
+          cargo test --manifest-path src/apps/desktop/src-tauri/Cargo.toml
+          cargo test -p dbo-fs --manifest-path src/Cargo.toml
+
       - name: Compilar, assinar e subir para o rascunho
         # tauri-action v1.0.0 (fixado no commit)
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
@@ -337,14 +349,17 @@ jobs:
           gh api -X PATCH "repos/$GH_REPO/releases/$ID" \
             -f tag_name="$RELEASE_TAG" -F draft=false -F prerelease="$PRE" -f make_latest="$MAKE_LATEST" > /dev/null
 
+          # Até 1 min de novas tentativas: o GitHub demora alguns segundos para servir um release
+          # recém-publicado (e o releases/latest/download pode responder o latest.json anterior).
+          retry() { for _ in 1 2 3 4 5 6; do "$@" && return 0; sleep 10; done; return 1; }
+          latest_has_version() {
+            curl -fsSL "https://github.com/$GH_REPO/releases/latest/download/latest.json" -o latest-now.json &&
+              [ "$(jq -r .version latest-now.json)" = "$VERSION" ]
+          }
+
           # As URLs públicas respondem (latest.json e cada instalador do atualizador).
           DL="https://github.com/$GH_REPO/releases/download/$RELEASE_TAG"
-          ok=
-          for i in 1 2 3 4 5 6; do
-            if curl -fsSL "$DL/latest.json" -o published.json; then ok=1; break; fi
-            sleep 10
-          done
-          [ -n "$ok" ] || { echo "::error::$DL/latest.json não respondeu"; exit 1; }
+          retry curl -fsSL "$DL/latest.json" -o published.json || { echo "::error::$DL/latest.json não respondeu"; exit 1; }
           if grep -q 'api.github.com' published.json; then
             echo "::error::o latest.json publicado ainda aponta para a API"; exit 1
           fi
@@ -356,8 +371,10 @@ jobs:
           [[ "$NOW" =~ ^[A-Za-z0-9._-]+$ ]] || NOW=""
           if [ "$PRE" = false ]; then
             [ "$NOW" = "$RELEASE_TAG" ] || { echo "::error::latest aponta para '$NOW', esperado $RELEASE_TAG"; exit 1; }
-            V=$(curl -fsSL "https://github.com/$GH_REPO/releases/latest/download/latest.json" | jq -r .version)
-            [ "$V" = "$VERSION" ] || { echo "::error::releases/latest/download/latest.json tem versão '$V', esperado $VERSION"; exit 1; }
+            if ! retry latest_has_version; then
+              V=$(jq -r .version latest-now.json 2>/dev/null) || V=""
+              echo "::error::releases/latest/download/latest.json tem versão '${V:-(não respondeu)}', esperado $VERSION"; exit 1
+            fi
             echo "Publicado $RELEASE_TAG como latest."
           else
             # Um lançamento oficial pode ter rodado em paralelo (fila separada), então não se compara
